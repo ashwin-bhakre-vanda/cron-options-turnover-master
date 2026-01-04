@@ -89,41 +89,59 @@ def normalise_ticker(t: str) -> str:
     return "".join(ch for ch in t if ch.isalnum())
 
 
+import gc
+
 def build_group(name: str, file_list: list[str]) -> pd.DataFrame:
     log.info(f"=== Building {name} ===")
     t0 = time.time()
 
-    frames = []
+    acc = None
 
     for key in file_list:
+        log.info(f"Processing {key}")
+
+        # 1) Load + melt ONE file only
         df = load_from_s3(key)
-        log.info(f"{key}: raw shape={df.shape}")
+        log.info(f"{key}: raw={df.shape}")
 
         df = melt_wide(df)
+        log.info(f"{key}: melted={df.shape}")
 
         df["ticker_norm"] = df["ticker"].map(normalise_ticker)
         df["turnover"] = pd.to_numeric(df["turnover"], errors="coerce")
         df.dropna(subset=["turnover"], inplace=True)
         df["date"] = pd.to_datetime(df.iloc[:, 0])
 
-        log.info(f"{key}: melted shape={df.shape}")
-        frames.append(df)
+        # 2) Aggregate immediately
+        grouped = (
+            df.groupby(["date", "ticker", "ticker_norm"], as_index=False)
+              .agg(turnover=("turnover", "sum"))
+        )
+        log.info(f"{key}: grouped={grouped.shape}")
 
-    big = pd.concat(frames, ignore_index=True)
-    log.info(f"{name}: concatenated rows={len(big):,}")
+        # 3) Merge into accumulator (small)
+        if acc is None:
+            acc = grouped
+        else:
+            acc = (
+                pd.concat([acc, grouped], ignore_index=True)
+                  .groupby(
+                      ["date", "ticker", "ticker_norm"],
+                      as_index=False
+                  )
+                  .agg(turnover=("turnover", "sum"))
+            )
 
-    final = (
-        big.groupby(["date", "ticker", "ticker_norm"], as_index=False)
-           .agg(turnover=("turnover", "sum"))
-    )
+        # 4) Free memory aggressively
+        del df, grouped
+        gc.collect()
 
     log.info(
-        f"{name}: final rows={len(final):,} "
+        f"{name}: final rows={len(acc):,} "
         f"(took {time.time() - t0:.1f}s)"
     )
 
-    del big
-    return final
+    return acc
 
 
 def save_parquet(df: pd.DataFrame, name: str) -> None:
